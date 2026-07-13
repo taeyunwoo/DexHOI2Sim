@@ -1,0 +1,20 @@
+name: dexhoi2sim
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pip
+  - pip:
+      - numpy==1.23.5
+      - scipy>=1.10
+      - torch>=2.0
+      - mujoco>=3.2
+      - imageio>=2.30
+      - imageio-ffmpeg>=0.4
+      - pyyaml>=6.0
+      - trimesh>=4.0
+      - smplx>=0.1.28
+      - pymeshlab>=2022.2
+# IsaacGym (optional): not on PyPI — install Preview 4 manually into this env from
+# https://developer.nvidia.com/isaac-gym, then `pip install -e isaacgym/python`.

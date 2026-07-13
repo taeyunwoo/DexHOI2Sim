@@ -1,0 +1,15 @@
+# DexHOI2Sim — MuJoCo path (the IsaacGym backend is optional, installed separately)
+numpy==1.23.5
+scipy>=1.10
+torch>=2.0            # smplx forward + (optional) isaacgym
+mujoco>=3.2
+imageio>=2.30
+imageio-ffmpeg>=0.4
+pyyaml>=6.0
+trimesh>=4.0
+smplx>=0.1.28         # MANO forward / rest joints (register at mano.is.tue.mpg.de)
+pymeshlab>=2022.2     # generate_urdf mesh partitioning
+
+# NOT required: manopth — the MANO PCA basis is read directly from the .pkl.
+# IsaacGym (optional backend): install manually from developer.nvidia.com/isaac-gym
+#   (Preview 4), then run with LD_LIBRARY_PATH=<env>/lib and ninja on PATH.

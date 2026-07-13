@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+outputs/
+out/
+# generated intermediate sim files
+**/_isaac.urdf
+**/_obj.urdf
+**/_scene.xml
+**/_hand.xml
+mano2urdf/assets/*.pkl
+mano2urdf/outputs/
+*.mp4
