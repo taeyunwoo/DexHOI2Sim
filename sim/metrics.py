@@ -47,7 +47,7 @@ def trajectory_error(urdf_dir, meshes, obj_pose_tag, frames, fps=30):
     act_qadr = np.array([model.jnt_qposadr[model.actuator_trnid[a, 0]]
                          for a in range(model.nu)])
 
-    ref_q = np.stack([to_qpos(fr, base_q) for fr in frames])       # (T, nq)
+    ref_q = np.stack([to_qpos(fr, base_q.copy()) for fr in frames])   # (T, nq)
     ref_q[:, obj_qadr:obj_qadr + 7] = obj_pose_tag
     T = len(frames)
 

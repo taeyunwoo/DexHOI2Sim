@@ -119,6 +119,75 @@ frame is converted internally; for custom data *you* supply the upright frame.)
 You can also pass the pieces individually instead of a bundle: `--custom
 --betas-yml … --poses … --trans … --object-cad … --object-poses …`.
 
+### Two hands (custom bimanual)
+
+For a two-hand interaction, put a **`hands` list** in the bundle instead of the flat
+`betas`/`hand_pose`/`trans`/`side` keys — each entry has that hand's `betas`,
+`hand_pose (T,48)`, `trans (T,3)`, and `side` (the object keys stay shared):
+
+```python
+bundle = {"hands": [ {"betas": …, "hand_pose": …, "trans": …, "side": "right"},
+                     {"betas": …, "hand_pose": …, "trans": …, "side": "left"} ],
+          "object_mesh": "obj.obj", "object_poses": …, "object_color": [.2,.5,.85]}
+```
+
+Ready-to-run synthetic example (two hands grasping a box):
+
+```bash
+python examples/make_sample_bundle_twohands.py     # writes examples/sample_twohands.npz
+python replicate.py --bundle examples/sample_twohands.npz --backend both \
+    --mode kinematic --out-dir out/sample_two
+```
+
+![sample-twohands](docs/media/sample_twohands.gif)
+
+Or pass a second hand on the command line: add `--poses2 … --trans2 … [--left2]
+[--betas-yml2 …]` to the `--custom` form (the 2nd hand reuses `--betas-yml` if you
+omit `--betas-yml2`). The desk height is auto-inferred from the object's resting
+pose and the camera frames both hands. The trajectory metric (`--eval`) is
+single-hand only, so bimanual runs render but skip scoring.
+
+## HO-Cap — two hands, three interactions
+
+[HO-Cap](https://irvlutd.github.io/HOCap/) sessions replay directly, including
+**bimanual** ones. One flag drives all three task types (the loader picks up 1 or
+2 hands and the manipulated object automatically):
+
+```bash
+# handover (two hands pass the object)
+python replicate.py --hocap --subject subject_2 --session 20231022_200657 \
+    --backend both --mode kinematic --out-dir out/handover
+
+# pick-and-place / affordance-use are single-hand sessions — same command
+python replicate.py --hocap --subject subject_2 --session 20231022_201316 \
+    --backend mujoco --out-dir out/pickplace          # task 1
+python replicate.py --hocap --subject subject_2 --session 20231022_201556 \
+    --backend mujoco --out-dir out/affordance         # task 3
+```
+
+Bimanual **handover** (`subject_2 / 20231022_200657`, object `G07_4`) — both hands
+replicated in one shared Z-up world; the desk height is inferred from the object's
+resting pose so it sits on the table instead of falling:
+
+| MuJoCo — kinematic | MuJoCo — physics | IsaacGym — kinematic |
+| --- | --- | --- |
+| ![hk](docs/media/handover_mujoco_kinematic.gif) | ![hp](docs/media/handover_mujoco_physics.gif) | ![hi](docs/media/handover_isaac_kinematic.gif) |
+
+Of HO-Cap's three tasks only **handover** is genuinely two-handed; pick-and-place
+and affordance-use are single-hand (the other hand rests ~1.7 m away), so the loader
+replicates those with one hand.
+
+HO-Cap uses the **same manopth PCA basis as DexYCB**, so the loader
+(`sim/hocap_loader.py`) reads betas from `calibration/mano/<subject>.yaml`, expands
+the PCA straight from the MANO pkl, and takes object CAD from
+`models/<id>/textured_mesh.obj` — no manopth dependency. Objects carry their HO-Cap
+texture in IsaacGym; MuJoCo shades them a solid color. You only need the (small)
+`models/`, `calibration/` and per-session pose folders — the multi-GB RGB-D is not
+required to replicate. The sim frame is already Z-up, so no camera→world transform.
+
+`grasp_success` / the trajectory metric are **single-hand only** for now; bimanual
+sessions render but skip `--eval`.
+
 ## Metric — does the object follow its intended trajectory?
 
 The one thing that matters: **when the hand executes the generated motion in
@@ -130,16 +199,17 @@ reference path (small error → `grasp_success`); a failed grasp lets it stay, s
 or fall (large error). Naive replay of a kinematic reference typically fails here
 — which is exactly what makes this a useful benchmark for HOI-generation methods.
 
-## Two hands, two paths
+## Hand model
 
-The default and recommended hand is **MANO2URDF (45-DOF, analytic)**. A 22-DOF
-ArtiMANO variant (retargeting-optimized, dexterous-robot lineage) exists in the
-research history but is **not** part of this repo.
+The hand is **MANO2URDF (45-DOF, analytic)** — the real MANO mesh split into 16
+links, driven by joint angles computed directly from the MANO pose (no IK, no
+optimization). Both single-hand (DexYCB/custom) and two-hand (HO-Cap) sequences
+use it; a bimanual scene is just two of these hands in one shared world frame.
 
 ## Repo layout
 
 ```
-replicate.py                     # CLI: build -> simulate -> evaluate (DexYCB or --bundle)
+replicate.py                     # CLI: build -> simulate -> evaluate (DexYCB / --bundle / --hocap)
 examples/make_sample_bundle.py   # writes a synthetic sample.npz you can run
 mano2urdf/
   scripts/generate_urdf.py       #  beta -> hand URDF + 16 MANO link meshes
@@ -153,6 +223,7 @@ sim/
   metrics.py                     #  object trajectory tracking (sim vs reference)
   verify_mujoco_fk.py            #  MuJoCo-FK vs MANO joint check
   dexycb_loader.py, dexycb_world.py  # DexYCB seq loading + master->tag(Z-up) frame
+  hocap_loader.py                #  HO-Cap session -> hands + objects (bimanual)
 ```
 
 ## Key facts (so you don't re-derive them)

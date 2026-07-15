@@ -123,7 +123,7 @@ SCENE_TPL = """<mujoco model="mano2urdf_scene">
     <camera name="view" mode="targetbody" target="lookat" pos="{cam_pos}"/>
 {object_body}
   </worldbody>
-  <include file="_hand.xml"/>
+{hand_includes}
 {actuators}
 </mujoco>"""
 
@@ -143,37 +143,46 @@ def make_actuators(joint_names, kp_wrist=400.0, kp_finger=6.0,
     return "\n".join(rows)
 
 
-def build_hand_model(urdf_dir: Path, gravity: float, floor_z: float,
+MJ_COMPILER_ABS = ('<mujoco><compiler strippath="false" balanceinertia="true" '
+                   'boundmass="0.001" boundinertia="1e-6" discardvisual="false"/></mujoco>')
+
+
+def build_hand_model(urdf_dir, gravity: float, floor_z: float,
                      cam_pos: str, lookat: str, object_body: str = "",
                      object_asset: str = "", actuated: bool = False):
-    """Convert the MANO2URDF hand URDF to MJCF, wrap it in a scene (floor/light/
-    camera/object) via a top-level <include>, and compile. The scene + _hand.xml
-    are written INTO urdf_dir so the meshdir="meshes" reference resolves.
-    If actuated, add PD position actuators for the hand joints (physics mode).
+    """Build a scene with ONE OR MORE MANO2URDF hands (bimanual) + floor/light/
+    camera/object, and compile. `urdf_dir` may be a single dir or a list (one per
+    hand, e.g. right + left — their joint/body names are side-prefixed so they
+    don't collide). Mesh paths are made absolute so hands from different dirs all
+    resolve. If actuated, add PD position actuators for every hand joint.
     Returns (model, scene_path)."""
-    urdf_path = next(urdf_dir.glob("*.urdf"))
-    txt = urdf_path.read_text()
-    txt = mesh_collision_urdf(txt)          # collision meshes = visual MANO meshes
-    txt = re.sub(r"(<robot[^>]*>)", r"\1\n" + MJ_COMPILER, txt, count=1)
+    urdf_dirs = [urdf_dir] if not isinstance(urdf_dir, (list, tuple)) else list(urdf_dir)
+    work = Path(urdf_dirs[0]).resolve()          # scene + _hand_i.xml live here
+    includes, all_joints = [], []
     cwd = os.getcwd()
-    os.chdir(urdf_dir)
+    os.chdir(work)
     try:
-        hand = mujoco.MjModel.from_xml_string(txt)   # hand-only: get joint names
-        mujoco.mj_saveLastXML("_hand.xml", hand)
-        actuators = ""
-        if actuated:
-            jnames = [mujoco.mj_id2name(hand, mujoco.mjtObj.mjOBJ_JOINT, j)
-                      for j in range(hand.njnt)]
-            actuators = make_actuators(jnames)
+        for i, ud in enumerate(urdf_dirs):
+            ud = Path(ud).resolve()
+            txt = mesh_collision_urdf(next(ud.glob("*.urdf")).read_text())
+            txt = txt.replace('filename="./meshes/', f'filename="{ud}/meshes/')  # abs
+            txt = re.sub(r"(<robot[^>]*>)", r"\1\n" + MJ_COMPILER_ABS, txt, count=1)
+            hand = mujoco.MjModel.from_xml_string(txt)
+            mujoco.mj_saveLastXML(f"_hand_{i}.xml", hand)
+            includes.append(f'  <include file="_hand_{i}.xml"/>')
+            all_joints += [mujoco.mj_id2name(hand, mujoco.mjtObj.mjOBJ_JOINT, j)
+                           for j in range(hand.njnt)]
+        actuators = make_actuators(all_joints) if actuated else ""
         scene = SCENE_TPL.format(gravity=gravity, floor_z=f"{floor_z:.3f}",
                                  cam_pos=cam_pos, lookat=lookat,
                                  object_body=object_body, object_asset=object_asset,
-                                 actuators=actuators)
+                                 actuators=actuators,
+                                 hand_includes="\n".join(includes))
         Path("_scene.xml").write_text(scene)
         model = mujoco.MjModel.from_xml_path("_scene.xml")
     finally:
         os.chdir(cwd)
-    return model, urdf_dir / "_scene.xml"
+    return model, work / "_scene.xml"
 
 
 # ---------- DexYCB object + master→tag (Z-up) frame ----------
@@ -275,6 +284,38 @@ def object_xml(meshes, mass=0.3, color=None):
     return asset, body
 
 
+def estimate_table_z(mesh_path, obj_pose_tag):
+    """Infer the desk/table-top height from the object at rest. The object never
+    penetrates the table, so its lowest vertex touches the surface when resting on
+    it (start/end of the sequence). Transform the object's lowest point into the
+    world for every frame and take a low percentile of that height → the table top."""
+    import trimesh
+    from scipy.spatial.transform import Rotation as Rsc
+    V = np.asarray(trimesh.load(mesh_path, process=False, force="mesh").vertices, float)
+    pos = obj_pose_tag[:, :3]
+    quat_xyzw = obj_pose_tag[:, [4, 5, 6, 3]]                # wxyz stored → xyzw
+    step = max(1, len(obj_pose_tag) // 200)                 # sample ≤200 frames
+    bottom = []
+    for t in range(0, len(obj_pose_tag), step):
+        R = Rsc.from_quat(quat_xyzw[t]).as_matrix()
+        bottom.append((V @ R.T)[:, 2].min() + pos[t, 2])
+    return float(np.percentile(bottom, 3))                  # resting height (robust)
+
+
+def scene_camera(points, back=1.6, up_frac=0.55, zoom=1.5):
+    """Frame the whole scene: look at the bbox center of `points` (N,3) and place
+    the camera back (−Y) + up (+Z) so the full motion fits. `zoom` pulls the camera
+    in (distance ÷ zoom) — zoom=1.5 gives a 1.5× closer, tighter view.
+    Returns (cam_pos_str, lookat_str)."""
+    lo, hi = points.min(0), points.max(0)
+    ctr = (lo + hi) / 2.0
+    diag = float(np.linalg.norm(hi - lo))
+    dist = (diag * back + 0.3) / zoom
+    cam = ctr + np.array([0.0, -dist, dist * up_frac])
+    return (f"{cam[0]:.3f} {cam[1]:.3f} {cam[2]:.3f}",
+            f"{ctr[0]:.3f} {ctr[1]:.3f} {ctr[2]:.3f}")
+
+
 def load_frames(frames_dir: Path):
     files = sorted(glob.glob(str(frames_dir / "*.json")))
     frames = [json.load(open(f)) for f in files]
@@ -282,18 +323,22 @@ def load_frames(frames_dir: Path):
 
 
 def build_qpos_indexer(model):
-    """Return function frame_json -> full qpos vector (nq)."""
+    """Return function(frame_json, qpos) that writes ONE hand's DOFs into qpos.
+    The side (left/right) is inferred from the frame's joint_angles prefix, so the
+    generic wrist_xyz/wrist_rpy map to that hand's <side>_wrist_0* joints. For
+    bimanual, call it once per hand's frame on the same qpos vector."""
     name2adr = {}
     for j in range(model.njnt):
         nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
         name2adr[nm] = model.jnt_qposadr[j]
 
-    def to_qpos(fr, base_qpos):
-        q = base_qpos.copy()
-        wx = fr["wrist_xyz"]; wr = fr["wrist_rpy"]
-        for nm, v in zip(["right_wrist_0x", "right_wrist_0y", "right_wrist_0z"], wx):
+    def to_qpos(fr, q):
+        side = next(iter(fr["joint_angles"])).split("_")[0]   # 'left' or 'right'
+        for ax, v in zip(["x", "y", "z"], fr["wrist_xyz"]):
+            nm = f"{side}_wrist_0{ax}"
             if nm in name2adr: q[name2adr[nm]] = v
-        for nm, v in zip(["right_wrist_0rx", "right_wrist_0ry", "right_wrist_0rz"], wr):
+        for ax, v in zip(["rx", "ry", "rz"], fr["wrist_rpy"]):
+            nm = f"{side}_wrist_0{ax}"
             if nm in name2adr: q[name2adr[nm]] = v
         for nm, v in fr["joint_angles"].items():
             if nm in name2adr: q[name2adr[nm]] = v
@@ -305,6 +350,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--urdf-dir", required=True)
     ap.add_argument("--frames-dir", required=True)
+    ap.add_argument("--urdf-dir2", default=None, help="second hand URDF (bimanual)")
+    ap.add_argument("--frames-dir2", default=None, help="second hand frames (bimanual)")
     ap.add_argument("--mode", default="kinematic", choices=["kinematic", "physics"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--fps", type=int, default=30)
@@ -324,12 +371,14 @@ def main():
                     help="solid RGB for custom object")
     args = ap.parse_args()
 
-    urdf_dir = Path(args.urdf_dir).resolve()
+    urdf_dirs = [Path(args.urdf_dir).resolve()]
+    hand_frames = [load_frames(Path(args.frames_dir))]           # list of frame-sets
+    if args.urdf_dir2:                                           # bimanual second hand
+        urdf_dirs.append(Path(args.urdf_dir2).resolve())
+        hand_frames.append(load_frames(Path(args.frames_dir2)))
     work = Path(args.out).resolve().parent
     work.mkdir(parents=True, exist_ok=True)
-
-    frames = load_frames(Path(args.frames_dir))
-    print(f"[seq] {len(frames)} frames")
+    print(f"[seq] {len(hand_frames)} hand(s), {len(hand_frames[0])} frames")
 
     object_asset = object_body = ""
     obj_pose_tag = None
@@ -345,12 +394,12 @@ def main():
     elif args.subject and args.session:
         obj_name, meshes, obj_pose_tag, tag = load_dexycb_object_tag(
             args.dexycb_root, args.subject, args.session)
-        frames = transform_frames_to_tag(frames, tag)          # fix flip → Z-up
+        hand_frames = [transform_frames_to_tag(f, tag) for f in hand_frames]   # → Z-up
         object_asset, object_body = object_xml(meshes)
         dexycb_cam = dexycb_camera_in_tag(args.dexycb_root, args.subject, args.session, tag)
         print(f"[obj] {obj_name}  (textured, tag frame)   [cam] DexYCB extrinsics")
 
-    wrists = np.array([f["wrist_xyz"] for f in frames])
+    wrists = np.array([f["wrist_xyz"] for fs in hand_frames for f in fs])
     if dexycb_cam is not None:
         # use the original DexYCB camera pose (tag frame); table plane at z=0
         cam_pos_t, cam_tgt_t, fovy = dexycb_cam
@@ -358,14 +407,20 @@ def main():
         lookat = f"{cam_tgt_t[0]:.4f} {cam_tgt_t[1]:.4f} {cam_tgt_t[2]:.4f}"
         floor_z = 0.0                                          # AprilTag table plane
     else:
-        ctr = wrists.mean(axis=0)
-        lookat = f"{ctr[0]:.3f} {ctr[1]:.3f} {ctr[2]:.3f}"
-        cam_pos = f"{ctr[0]:.3f} {ctr[1]-0.55:.3f} {ctr[2]+0.25:.3f}"
-        floor_z = float(wrists[:, 2].min() - 0.20)
+        # frame the whole scene from the full hand + object motion (pulled back)
+        pts = wrists
+        if obj_pose_tag is not None:
+            pts = np.concatenate([wrists, obj_pose_tag[:, :3]], axis=0)
+        cam_pos, lookat = scene_camera(pts)
+        if obj_pose_tag is not None and args.object_cad:      # desk = object rest height
+            floor_z = estimate_table_z(args.object_cad, obj_pose_tag)
+            print(f"[desk] table top inferred at z={floor_z:.3f} m (object rest)")
+        else:
+            floor_z = float(wrists[:, 2].min() - 0.20)
 
     physics = args.mode == "physics"
     model, scene_path = build_hand_model(
-        urdf_dir,
+        urdf_dirs,
         gravity=(-9.81 if physics else 0.0),
         floor_z=floor_z,
         cam_pos=cam_pos, lookat=lookat,
@@ -386,17 +441,23 @@ def main():
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "obj_free")
         obj_qadr = model.jnt_qposadr[jid]
 
-    # per-frame reference full qpos
-    ref_q = np.stack([to_qpos(fr, base_q) for fr in frames])       # (T, nq)
+    # per-frame reference full qpos — combine all hands into one qpos per frame
+    T = min(len(fs) for fs in hand_frames)
+    ref_q = np.zeros((T, model.nq), dtype=np.float64)
+    for t in range(T):
+        q = base_q.copy()
+        for fs in hand_frames:
+            to_qpos(fs[t], q)                 # writes this hand's DOFs into q
+        ref_q[t] = q
     if obj_qadr is not None:
-        ref_q[:, obj_qadr:obj_qadr + 7] = obj_pose_tag
+        ref_q[:, obj_qadr:obj_qadr + 7] = obj_pose_tag[:T]
 
     renderer = mujoco.Renderer(model, height=args.height, width=args.width)
     out_frames = []
 
     if not physics:
         # kinematic: set full state each frame, FK only
-        for t in range(len(frames)):
+        for t in range(T):
             data.qpos[:] = ref_q[t]
             mujoco.mj_forward(model, data)
             renderer.update_scene(data, camera="view")
@@ -415,7 +476,6 @@ def main():
         mujoco.mj_forward(model, data)
 
         dt = model.opt.timestep
-        T = len(frames)
         dur = T / float(args.fps)
         n_steps = int(dur / dt)
         render_stride = max(1, int(round(1.0 / (args.fps * dt))))

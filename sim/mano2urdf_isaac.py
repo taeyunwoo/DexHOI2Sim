@@ -27,7 +27,8 @@ sys.path.insert(0, str(_REPO))
 # reuse the frame / tag / object helpers from the MuJoCo backend
 from mano2urdf_mujoco import (load_frames, load_dexycb_object_tag,
                               transform_frames_to_tag, dexycb_camera_in_tag,
-                              mesh_collision_urdf, widen_base_limits)
+                              mesh_collision_urdf, widen_base_limits,
+                              estimate_table_z, scene_camera)
 
 # MANO2URDF hand body → smplx MANO joint index (palm = right_wrist_rz)
 LINK_TO_MANO = {
@@ -41,21 +42,43 @@ LINK_TO_MANO = {
 
 
 def frames_to_dof_traj(frames, dof_names):
-    """(T, ndof) in the asset DOF order, from the frame json (names match)."""
+    """(T, ndof) in the asset DOF order. Side (left/right) is inferred from the
+    frame's joint_angles prefix so wrist_xyz/wrist_rpy map to <side>_wrist_0*."""
     T = len(frames)
     traj = np.zeros((T, len(dof_names)), dtype=np.float32)
     for t, fr in enumerate(frames):
+        side = next(iter(fr["joint_angles"])).split("_")[0]
         vals = dict(fr["joint_angles"])
-        for nm, v in zip(["right_wrist_0x", "right_wrist_0y", "right_wrist_0z"],
-                         fr["wrist_xyz"]):
-            vals[nm] = v
-        for nm, v in zip(["right_wrist_0rx", "right_wrist_0ry", "right_wrist_0rz"],
-                         fr["wrist_rpy"]):
-            vals[nm] = v
+        for ax, v in zip(["x", "y", "z"], fr["wrist_xyz"]):
+            vals[f"{side}_wrist_0{ax}"] = v
+        for ax, v in zip(["rx", "ry", "rz"], fr["wrist_rpy"]):
+            vals[f"{side}_wrist_0{ax}"] = v
         for i, dn in enumerate(dof_names):
             if dn in vals:
                 traj[t, i] = vals[dn]
     return traj
+
+
+def _prep_hand_urdf(urdf_dir, physics):
+    """Write an IsaacGym-ready URDF for one hand (visual-only for kinematic;
+    mesh-collision for physics; absolute mesh paths). Returns the filename."""
+    import xml.etree.ElementTree as ET
+    urdf_dir = Path(urdf_dir)
+    src = (list(urdf_dir.glob("subject*.urdf")) or list(urdf_dir.glob("*.urdf")))[0]
+    if physics:
+        txt = widen_base_limits(mesh_collision_urdf(src.read_text()), lim=20.0)
+        root = ET.fromstring(txt)
+    else:
+        root = ET.fromstring(src.read_text())
+        for link in root.findall("link"):
+            for col in link.findall("collision"):
+                link.remove(col)
+    for m in root.iter("mesh"):
+        fn = m.get("filename", "")
+        if fn.startswith("./meshes/"):
+            m.set("filename", f"{urdf_dir}/meshes/" + fn[len("./meshes/"):])
+    (urdf_dir / "_isaac.urdf").write_text(ET.tostring(root, encoding="unicode"))
+    return "_isaac.urdf"
 
 
 def mano_joints(frames_dir, betas_npy, model_dir):
@@ -92,44 +115,36 @@ def main():
     ap.add_argument("--object-cad", default=None)
     ap.add_argument("--object-poses", default=None)
     ap.add_argument("--object-color", default="0.75 0.72 0.62")
+    ap.add_argument("--urdf-dir2", default=None, help="second hand URDF (bimanual)")
+    ap.add_argument("--frames-dir2", default=None, help="second hand frames (bimanual)")
     args = ap.parse_args()
 
-    import xml.etree.ElementTree as ET
     physics = args.mode == "physics"
-    urdf_dir = Path(args.urdf_dir).resolve()
-    src = (list(urdf_dir.glob("subject*.urdf")) or list(urdf_dir.glob("*.urdf")))[0]
-    # kinematic: VISUAL-ONLY URDF (hograspnet *_fkonly) — box/capsule <collision>
-    # primitives make IsaacGym emit "resolve collision mesh ''" and drop the body.
-    # physics: replace <collision> with the named MANO meshes (convex hulls) so the
-    # fingers can contact the object. Mesh paths → absolute either way.
-    if physics:
-        txt = mesh_collision_urdf(src.read_text())
-        txt = widen_base_limits(txt, lim=20.0)
-        root = ET.fromstring(txt)
-    else:
-        root = ET.fromstring(src.read_text())
-        for link in root.findall("link"):
-            for col in link.findall("collision"):
-                link.remove(col)
-    for m in root.iter("mesh"):
-        fn = m.get("filename", "")
-        if fn.startswith("./meshes/"):
-            m.set("filename", f"{urdf_dir}/meshes/" + fn[len("./meshes/"):])
-    urdf_file = "_isaac.urdf"
-    (urdf_dir / urdf_file).write_text(ET.tostring(root, encoding="unicode"))
-
-    frames = load_frames(Path(args.frames_dir))
+    hand_dirs = [(Path(args.urdf_dir).resolve(), args.frames_dir)]
+    if args.urdf_dir2:                                          # bimanual second hand
+        hand_dirs.append((Path(args.urdf_dir2).resolve(), args.frames_dir2))
+    # prepare each hand's IsaacGym URDF (visual-only for kinematic; mesh-collision
+    # for physics; absolute mesh paths) and load its frames
+    hand_urdf_files = [_prep_hand_urdf(ud, physics) for ud, _ in hand_dirs]
+    frames = load_frames(Path(args.frames_dir))                # first hand (for camera/DexYCB)
     custom = args.object_cad is not None
+    table_z = 0.0
     if custom:                                             # non-DexYCB: solid color
         obj_name = Path(args.object_cad).name
         cad = str(Path(args.object_cad).resolve())
         meshes = {"vis": cad, "col": cad}
         obj_pose_tag = np.load(args.object_poses).astype(np.float32)   # (T,7) Z-up
         obj_color = [float(x) for x in args.object_color.split()]
-        ctr = obj_pose_tag[:, :3].mean(0)
-        d = 0.6
-        cam_pos_t = np.array([ctr[0], ctr[1] - d, ctr[2] + 0.3], np.float32)
-        cam_tgt_t = ctr.astype(np.float32); fovy = 55.0
+        # frame the whole scene: bbox of all hands' wrists + object path, pulled back
+        wr = np.array([f["wrist_xyz"] for _, fd in hand_dirs
+                       for f in load_frames(Path(fd))])
+        pts = np.concatenate([wr, obj_pose_tag[:, :3]], axis=0)
+        lo, hi = pts.min(0), pts.max(0); ctr = (lo + hi) / 2.0
+        diag = float(np.linalg.norm(hi - lo)); dist = (diag * 1.6 + 0.3) / 1.5  # 1.5× closer
+        cam_pos_t = (ctr + np.array([0.0, -dist, dist * 0.55])).astype(np.float32)
+        cam_tgt_t = ctr.astype(np.float32); fovy = 45.0
+        table_z = estimate_table_z(cad, obj_pose_tag)      # desk = object rest height
+        print(f"[desk] table top inferred at z={table_z:.3f} m (object rest)")
     else:                                                  # DexYCB
         obj_name, meshes, obj_pose_tag, tag = load_dexycb_object_tag(
             args.dexycb_root, args.subject, args.session)
@@ -156,6 +171,7 @@ def main():
     # ground plane (Z-up) + lights
     pp = gymapi.PlaneParams()
     pp.normal = gymapi.Vec3(0, 0, 1)
+    pp.distance = -float(table_z)              # ground plane at z=table_z (desk top)
     gym.add_ground(sim, pp)
     gym.set_light_parameters(sim, 0, gymapi.Vec3(0.9, 0.9, 0.9),
                              gymapi.Vec3(0.4, 0.4, 0.4), gymapi.Vec3(1, 1, -2))
@@ -172,32 +188,39 @@ def main():
     o.override_inertia = True
     o.default_dof_drive_mode = int(gymapi.DOF_MODE_POS if physics
                                    else gymapi.DOF_MODE_NONE)
-    hand_asset = gym.load_asset(sim, str(urdf_dir), urdf_file, o)
-    ndof = gym.get_asset_dof_count(hand_asset)
-    dof_names = [gym.get_asset_dof_name(hand_asset, i) for i in range(ndof)]
-    body_names = [gym.get_asset_rigid_body_name(hand_asset, i)
-                  for i in range(gym.get_asset_rigid_body_count(hand_asset))]
-    dof_traj = frames_to_dof_traj(frames, dof_names)       # (T, 51)
-
     env = gym.create_env(sim, gymapi.Vec3(-2, -2, 0), gymapi.Vec3(2, 2, 2), 1)
-    # filter bits: hand shapes share filter 1 (no self-collision → 1&1≠0), object
-    # filter 2 (hand↔object 1&2=0 → collide). Self-collision of the 63-body hand
-    # otherwise jams the solver and suppresses hand↔object contacts.
-    hand = gym.create_actor(env, hand_asset, gymapi.Transform(), "hand", 0, 1)
-    dp = gym.get_actor_dof_properties(env, hand)
-    dp["lower"][:] = -20; dp["upper"][:] = 20      # widen limits (avoid clamp)
-    if physics:
-        dp["driveMode"][:] = gymapi.DOF_MODE_POS
-        # stiff wrist (hold base pose), softer fingers (PD-track grasp)
-        is_wrist = np.array(["wrist_0" in n for n in dof_names])
-        dp["stiffness"][:] = np.where(is_wrist, 800.0, 40.0)
-        dp["damping"][:] = np.where(is_wrist, 40.0, 1.5)
-    else:
-        dp["driveMode"][:] = gymapi.DOF_MODE_NONE
-    gym.set_actor_dof_properties(env, hand, dp)
-    for bi in range(gym.get_actor_rigid_body_count(env, hand)):   # skin color
-        gym.set_rigid_body_color(env, hand, bi, gymapi.MESH_VISUAL_AND_COLLISION,
-                                 gymapi.Vec3(0.85, 0.72, 0.55))
+    urdf_dir = hand_dirs[0][0]                  # scratch dir for _obj.urdf
+    # filter bits: hand shapes share filter 1 (no self-collision), object filter 2.
+    dof_trajs, dof_names_all, hand_actors, body_names = [], [], [], []
+    for i, ((ud, fdir), uf) in enumerate(zip(hand_dirs, hand_urdf_files)):
+        asset = gym.load_asset(sim, str(ud), uf, o)
+        dn = [gym.get_asset_dof_name(asset, j)
+              for j in range(gym.get_asset_dof_count(asset))]
+        dof_trajs.append(frames_to_dof_traj(load_frames(Path(fdir)), dn))
+        dof_names_all += dn
+        actor = gym.create_actor(env, asset, gymapi.Transform(), f"hand{i}", 0, 1)
+        dp = gym.get_actor_dof_properties(env, actor)
+        dp["lower"][:] = -20; dp["upper"][:] = 20      # widen limits (avoid clamp)
+        if physics:
+            dp["driveMode"][:] = gymapi.DOF_MODE_POS
+            is_wrist = np.array(["wrist_0" in n for n in dn])
+            dp["stiffness"][:] = np.where(is_wrist, 800.0, 40.0)
+            dp["damping"][:] = np.where(is_wrist, 40.0, 1.5)
+        else:
+            dp["driveMode"][:] = gymapi.DOF_MODE_NONE
+        gym.set_actor_dof_properties(env, actor, dp)
+        for bi in range(gym.get_actor_rigid_body_count(env, actor)):   # skin color
+            gym.set_rigid_body_color(env, actor, bi, gymapi.MESH_VISUAL_AND_COLLISION,
+                                     gymapi.Vec3(0.85, 0.72, 0.55))
+        hand_actors.append(actor)
+        if i == 0:
+            body_names = [gym.get_asset_rigid_body_name(asset, j)
+                          for j in range(gym.get_asset_rigid_body_count(asset))]
+    T_dof = min(t.shape[0] for t in dof_trajs)
+    dof_traj = np.concatenate([t[:T_dof] for t in dof_trajs], axis=1)   # (T, sum ndof)
+    ndof = dof_traj.shape[1]
+    T = min(T_dof, len(obj_pose_tag))                  # frames to actually play
+    dof_traj = dof_traj[:T]
 
     # object actor (kinematic root, set per frame) — textured.obj (UVs) for the
     # visual so the DexYCB texture maps; textured_simple.obj for collision.
@@ -222,7 +245,7 @@ def main():
         gym.set_rigid_body_texture(env, obj_actor, 0,
                                    gymapi.MESH_VISUAL_AND_COLLISION, obj_tex)
     if physics:                              # match MuJoCo: high friction + generous
-        for act in (hand, obj_actor):        # contact_offset so near-miss fingers touch
+        for act in (*hand_actors, obj_actor):   # contact_offset so near-miss fingers touch
             sh = gym.get_actor_rigid_shape_properties(env, act)
             for p in sh:
                 p.friction = 1.5
@@ -258,9 +281,12 @@ def main():
     if do_render:
         import imageio.v2 as imageio
         out_frames = []
-        # hand base fixed at identity (set_actor_root_state writes ALL actors, so an
-        # unset hand root with zero quat would teleport it off-screen)
-        root_state[0, :] = 0.0; root_state[0, 6] = 1.0
+        # each hand base fixed at identity (set_actor_root_state writes ALL actors,
+        # so an unset hand root with zero quat would teleport it off-screen); object
+        # is the last actor (after the hand actors)
+        obj_idx = len(hand_actors)
+        for hi in range(len(hand_actors)):
+            root_state[hi, :] = 0.0; root_state[hi, 6] = 1.0
 
         def grab():
             gym.step_graphics(sim); gym.render_all_camera_sensors(sim)
@@ -271,7 +297,7 @@ def main():
             for t in range(T):
                 dof_state[:, 0] = dof_t[t]; dof_state[:, 1] = 0
                 gym.set_dof_state_tensor(sim, gymtorch.unwrap_tensor(dof_state.view(-1, 2)))
-                root_state[1, :] = obj_root_t[t]
+                root_state[obj_idx, :] = obj_root_t[t]
                 gym.set_actor_root_state_tensor(sim, gymtorch.unwrap_tensor(root_state))
                 gym.simulate(sim); gym.fetch_results(sim, True)
                 grab()
@@ -279,7 +305,7 @@ def main():
             # initial state: hand posed at frame 0, object at its frame-0 pose
             dof_state[:, 0] = dof_t[0]; dof_state[:, 1] = 0
             gym.set_dof_state_tensor(sim, gymtorch.unwrap_tensor(dof_state.view(-1, 2)))
-            root_state[1, :] = obj_root_t[0]
+            root_state[obj_idx, :] = obj_root_t[0]
             gym.set_actor_root_state_tensor(sim, gymtorch.unwrap_tensor(root_state))
             # settle the object onto the table (hand held at frame 0, NOT recorded)
             # so any initial ground/hand penetration jitter happens off-camera
