@@ -10,4 +10,3 @@ out/
 mano2urdf/assets/*.pkl
 mano2urdf/outputs/
 *.mp4
-!docs/media/*.mp4

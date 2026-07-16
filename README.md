@@ -167,19 +167,11 @@ Bimanual **handover** (`subject_2 / 20231022_200657`, object `G07_4`) — both h
 replicated in one shared Z-up world; the desk height is inferred from the object's
 resting pose so it sits on the table instead of falling:
 
-**MuJoCo — kinematic**
+| MuJoCo — kinematic | IsaacGym — kinematic | MuJoCo — physics |
+| --- | --- | --- |
+| ![hk](docs/media/handover_mujoco_kinematic.gif) | ![hi](docs/media/handover_isaac_kinematic.gif) | ![hp](docs/media/handover_mujoco_physics.gif) |
 
-<video src="https://github.com/taeyunwoo/DexHOI2Sim/raw/main/docs/media/handover_mujoco_kinematic.mp4" controls muted width="480"></video>
-
-**IsaacGym — kinematic**
-
-<video src="https://github.com/taeyunwoo/DexHOI2Sim/raw/main/docs/media/handover_isaac_kinematic.mp4" controls muted width="480"></video>
-
-**MuJoCo — physics**
-
-<video src="https://github.com/taeyunwoo/DexHOI2Sim/raw/main/docs/media/handover_mujoco_physics.mp4" controls muted width="480"></video>
-
-(In physics the hammer stays on the table: this handover *starts* with the object
+(Clips are sped up ~2×. In physics the hammer stays on the table: this handover *starts* with the object
 resting, so open-loop joint replay never re-forms the pick-up grasp — the same in
 both engines. Physics replay reproduces an interaction only when the grasp already
 holds at frame 0; see [the metric](#metric--does-the-object-follow-its-intended-trajectory).)
