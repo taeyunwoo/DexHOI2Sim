@@ -64,7 +64,10 @@ def _prep_hand_urdf(urdf_dir, physics):
     mesh-collision for physics; absolute mesh paths). Returns the filename."""
     import xml.etree.ElementTree as ET
     urdf_dir = Path(urdf_dir)
-    src = (list(urdf_dir.glob("subject*.urdf")) or list(urdf_dir.glob("*.urdf")))[0]
+    # the generated hand URDF, excluding intermediates (_isaac.urdf, _obj*.urdf) that
+    # this and the MuJoCo backend drop into the same dir
+    src = (list(urdf_dir.glob("subject*.urdf"))
+           or [f for f in sorted(urdf_dir.glob("*.urdf")) if not f.name.startswith("_")])[0]
     if physics:
         txt = widen_base_limits(mesh_collision_urdf(src.read_text()), lim=20.0)
         root = ET.fromstring(txt)
@@ -152,9 +155,11 @@ def main():
         frames = transform_frames_to_tag(frames, tag)      # Z-up tag frame
         objects.append({"meshes": meshes, "color": None, "poses": opose, "name": "object"})
 
-    if custom:                                             # frame scene from hands + all objects
+    if custom:                                             # frame on hands + main object
         wr = np.array([f["wrist_xyz"] for _, fd in hand_dirs for f in load_frames(Path(fd))])
-        pts = np.concatenate([wr] + [o["poses"][:, :3] for o in objects], axis=0)
+        mvo = max(objects, key=lambda o: float(
+            np.linalg.norm(o["poses"][:, :3] - o["poses"][0, :3], axis=1).max()))
+        pts = np.concatenate([wr, mvo["poses"][:, :3]], axis=0)
         lo, hi = pts.min(0), pts.max(0); ctr = (lo + hi) / 2.0
         diag = float(np.linalg.norm(hi - lo)); dist = (diag * 1.6 + 0.3) / 1.5  # 1.5× closer
         cam_pos_t = (ctr + np.array([0.0, -dist, dist * 0.55])).astype(np.float32)

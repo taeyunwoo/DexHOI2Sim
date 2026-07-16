@@ -164,7 +164,12 @@ def build_hand_model(urdf_dir, gravity: float, floor_z: float,
     try:
         for i, ud in enumerate(urdf_dirs):
             ud = Path(ud).resolve()
-            txt = mesh_collision_urdf(next(ud.glob("*.urdf")).read_text())
+            # pick the generated hand URDF, NOT the intermediate files the backends
+            # drop into this same dir (_isaac.urdf, _obj*.urdf, _scene.xml, ...) —
+            # those sort before hand.urdf and would silently replace the hand.
+            hand_urdf = next(f for f in sorted(ud.glob("*.urdf"))
+                             if not f.name.startswith("_"))
+            txt = mesh_collision_urdf(hand_urdf.read_text())
             txt = txt.replace('filename="./meshes/', f'filename="{ud}/meshes/')  # abs
             txt = re.sub(r"(<robot[^>]*>)", r"\1\n" + MJ_COMPILER_ABS, txt, count=1)
             hand = mujoco.MjModel.from_xml_string(txt)
@@ -420,10 +425,13 @@ def main():
         lookat = f"{cam_tgt_t[0]:.4f} {cam_tgt_t[1]:.4f} {cam_tgt_t[2]:.4f}"
         floor_z = 0.0                                          # AprilTag table plane
     else:
-        # frame the whole scene from the full hand + all-object motion (pulled back)
+        # frame on the hands + the most-moving (manipulated) object so both hands
+        # stay large/centred even when many idle objects are spread on the table
         pts = wrists
         if objects:
-            pts = np.concatenate([wrists] + [o["poses"][:, :3] for o in objects], axis=0)
+            mvo = max(objects, key=lambda o: float(
+                np.linalg.norm(o["poses"][:, :3] - o["poses"][0, :3], axis=1).max()))
+            pts = np.concatenate([wrists, mvo["poses"][:, :3]], axis=0)
         cam_pos, lookat = scene_camera(pts)
         if objects:                                            # desk = lowest object rest
             floor_z = min(estimate_table_z(o["meshes"]["vis"], o["poses"]) for o in objects)
