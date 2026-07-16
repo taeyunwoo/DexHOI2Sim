@@ -139,8 +139,6 @@ python replicate.py --bundle examples/sample_twohands.npz --backend both \
     --mode kinematic --out-dir out/sample_two
 ```
 
-![sample-twohands](docs/media/sample_twohands.gif)
-
 Or pass a second hand on the command line: add `--poses2 … --trans2 … [--left2]
 [--betas-yml2 …]` to the `--custom` form (the 2nd hand reuses `--betas-yml` if you
 omit `--betas-yml2`). The desk height is auto-inferred from the object's resting
@@ -169,9 +167,22 @@ Bimanual **handover** (`subject_2 / 20231022_200657`, object `G07_4`) — both h
 replicated in one shared Z-up world; the desk height is inferred from the object's
 resting pose so it sits on the table instead of falling:
 
-| MuJoCo — kinematic | MuJoCo — physics | IsaacGym — kinematic |
-| --- | --- | --- |
-| ![hk](docs/media/handover_mujoco_kinematic.gif) | ![hp](docs/media/handover_mujoco_physics.gif) | ![hi](docs/media/handover_isaac_kinematic.gif) |
+**MuJoCo — kinematic**
+
+<video src="https://github.com/taeyunwoo/DexHOI2Sim/raw/main/docs/media/handover_mujoco_kinematic.mp4" controls muted width="480"></video>
+
+**IsaacGym — kinematic**
+
+<video src="https://github.com/taeyunwoo/DexHOI2Sim/raw/main/docs/media/handover_isaac_kinematic.mp4" controls muted width="480"></video>
+
+**MuJoCo — physics**
+
+<video src="https://github.com/taeyunwoo/DexHOI2Sim/raw/main/docs/media/handover_mujoco_physics.mp4" controls muted width="480"></video>
+
+(In physics the hammer stays on the table: this handover *starts* with the object
+resting, so open-loop joint replay never re-forms the pick-up grasp — the same in
+both engines. Physics replay reproduces an interaction only when the grasp already
+holds at frame 0; see [the metric](#metric--does-the-object-follow-its-intended-trajectory).)
 
 Of HO-Cap's three tasks only **handover** is genuinely two-handed; pick-and-place
 and affordance-use are single-hand (the other hand rests ~1.7 m away), so the loader
