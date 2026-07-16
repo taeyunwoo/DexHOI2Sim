@@ -163,18 +163,22 @@ python replicate.py --hocap --subject subject_2 --session 20231022_201556 \
     --backend mujoco --out-dir out/affordance         # task 3
 ```
 
-Bimanual **handover** (`subject_2 / 20231022_200657`, object `G07_4`) — both hands
-replicated in one shared Z-up world; the desk height is inferred from the object's
-resting pose so it sits on the table instead of falling:
+Bimanual **handover** (`subject_2 / 20231022_200657`) — both hands replicated in one
+shared Z-up world with **all four session objects** loaded (each a distinct color);
+the desk height is inferred from the objects' resting pose so they sit on the table
+instead of falling:
 
 | MuJoCo — kinematic | IsaacGym — kinematic | MuJoCo — physics |
 | --- | --- | --- |
 | ![hk](docs/media/handover_mujoco_kinematic.gif) | ![hi](docs/media/handover_isaac_kinematic.gif) | ![hp](docs/media/handover_mujoco_physics.gif) |
 
-(Clips are sped up ~2×. In physics the hammer stays on the table: this handover *starts* with the object
-resting, so open-loop joint replay never re-forms the pick-up grasp — the same in
-both engines. Physics replay reproduces an interaction only when the grasp already
-holds at frame 0; see [the metric](#metric--does-the-object-follow-its-intended-trajectory).)
+By default `--hocap` loads **every object in the session** so you see the whole
+scene; pass `--hocap-object moved` for just the manipulated one, or `--hocap-object N`
+for a single index. (Clips are sped up ~2×. In physics the objects stay put: this
+handover *starts* with them resting on the table, so open-loop joint replay never
+re-forms the pick-up grasp — the same in both engines. Physics replay reproduces an
+interaction only when the grasp already holds at frame 0; see
+[the metric](#metric--does-the-object-follow-its-intended-trajectory).)
 
 Of HO-Cap's three tasks only **handover** is genuinely two-handed; pick-and-place
 and affordance-use are single-hand (the other hand rests ~1.7 m away), so the loader

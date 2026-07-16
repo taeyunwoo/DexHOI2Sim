@@ -115,6 +115,8 @@ def main():
     ap.add_argument("--object-cad", default=None)
     ap.add_argument("--object-poses", default=None)
     ap.add_argument("--object-color", default="0.75 0.72 0.62")
+    ap.add_argument("--objects-json", default=None,
+                    help='JSON list [{"mesh","poses","color"}] to load MANY objects')
     ap.add_argument("--urdf-dir2", default=None, help="second hand URDF (bimanual)")
     ap.add_argument("--frames-dir2", default=None, help="second hand frames (bimanual)")
     args = ap.parse_args()
@@ -127,29 +129,39 @@ def main():
     # for physics; absolute mesh paths) and load its frames
     hand_urdf_files = [_prep_hand_urdf(ud, physics) for ud, _ in hand_dirs]
     frames = load_frames(Path(args.frames_dir))                # first hand (for camera/DexYCB)
-    custom = args.object_cad is not None
+    custom = (args.object_cad is not None) or (args.objects_json is not None)
     table_z = 0.0
-    if custom:                                             # non-DexYCB: solid color
+    tag = None
+    objects = []          # each: {meshes, color(list|None for texture), poses(T,7), name}
+    if args.objects_json:                                  # many objects (HO-Cap)
+        for i, ob in enumerate(json.load(open(args.objects_json))):
+            m = str(Path(ob["mesh"]).resolve())
+            objects.append({"meshes": {"vis": m, "col": m},
+                            "color": [float(x) for x in str(ob.get("color", "0.75 0.72 0.62")).split()],
+                            "poses": np.load(ob["poses"]).astype(np.float32), "name": f"object{i}"})
+        obj_name = f"{len(objects)} objects"
+    elif args.object_cad:                                  # single custom object
+        m = str(Path(args.object_cad).resolve())
+        objects.append({"meshes": {"vis": m, "col": m},
+                        "color": [float(x) for x in args.object_color.split()],
+                        "poses": np.load(args.object_poses).astype(np.float32), "name": "object"})
         obj_name = Path(args.object_cad).name
-        cad = str(Path(args.object_cad).resolve())
-        meshes = {"vis": cad, "col": cad}
-        obj_pose_tag = np.load(args.object_poses).astype(np.float32)   # (T,7) Z-up
-        obj_color = [float(x) for x in args.object_color.split()]
-        # frame the whole scene: bbox of all hands' wrists + object path, pulled back
-        wr = np.array([f["wrist_xyz"] for _, fd in hand_dirs
-                       for f in load_frames(Path(fd))])
-        pts = np.concatenate([wr, obj_pose_tag[:, :3]], axis=0)
+    else:                                                  # DexYCB (textured)
+        obj_name, meshes, opose, tag = load_dexycb_object_tag(
+            args.dexycb_root, args.subject, args.session)
+        frames = transform_frames_to_tag(frames, tag)      # Z-up tag frame
+        objects.append({"meshes": meshes, "color": None, "poses": opose, "name": "object"})
+
+    if custom:                                             # frame scene from hands + all objects
+        wr = np.array([f["wrist_xyz"] for _, fd in hand_dirs for f in load_frames(Path(fd))])
+        pts = np.concatenate([wr] + [o["poses"][:, :3] for o in objects], axis=0)
         lo, hi = pts.min(0), pts.max(0); ctr = (lo + hi) / 2.0
         diag = float(np.linalg.norm(hi - lo)); dist = (diag * 1.6 + 0.3) / 1.5  # 1.5× closer
         cam_pos_t = (ctr + np.array([0.0, -dist, dist * 0.55])).astype(np.float32)
         cam_tgt_t = ctr.astype(np.float32); fovy = 45.0
-        table_z = estimate_table_z(cad, obj_pose_tag)      # desk = object rest height
+        table_z = min(estimate_table_z(o["meshes"]["vis"], o["poses"]) for o in objects)
         print(f"[desk] table top inferred at z={table_z:.3f} m (object rest)")
-    else:                                                  # DexYCB
-        obj_name, meshes, obj_pose_tag, tag = load_dexycb_object_tag(
-            args.dexycb_root, args.subject, args.session)
-        frames = transform_frames_to_tag(frames, tag)      # Z-up tag frame
-        obj_color = None
+    else:                                                  # DexYCB recording camera
         cam_pos_t, cam_tgt_t, fovy = dexycb_camera_in_tag(
             args.dexycb_root, args.subject, args.session, tag)
     T = len(frames)
@@ -219,33 +231,36 @@ def main():
     T_dof = min(t.shape[0] for t in dof_trajs)
     dof_traj = np.concatenate([t[:T_dof] for t in dof_trajs], axis=1)   # (T, sum ndof)
     ndof = dof_traj.shape[1]
-    T = min(T_dof, len(obj_pose_tag))                  # frames to actually play
+    T = min([T_dof] + [len(o["poses"]) for o in objects])   # frames to actually play
     dof_traj = dof_traj[:T]
 
-    # object actor (kinematic root, set per frame) — textured.obj (UVs) for the
-    # visual so the DexYCB texture maps; textured_simple.obj for collision.
-    obj_urdf = (f'<robot name="obj"><link name="obj">'
-                f'<visual><geometry><mesh filename="{meshes["vis"]}"/></geometry></visual>'
-                f'<collision><geometry><mesh filename="{meshes["col"]}"/></geometry></collision>'
-                f'<inertial><mass value="0.3"/>'
-                f'<inertia ixx="1e-3" ixy="0" ixz="0" iyy="1e-3" iyz="0" izz="1e-3"/>'
-                f'</inertial></link></robot>')
-    (urdf_dir / "_obj.urdf").write_text(obj_urdf)
+    # one actor per object (kinematic root set per frame; dynamic under physics).
+    # DexYCB: textured.obj (UVs) visual maps the CAD texture; else solid color.
     oo = gymapi.AssetOptions()
     oo.fix_base_link = not physics             # physics: dynamic (gravity + contact)
     oo.disable_gravity = not physics
     oo.override_inertia = True
-    obj_asset = gym.load_asset(sim, str(urdf_dir), "_obj.urdf", oo)
-    obj_actor = gym.create_actor(env, obj_asset, gymapi.Transform(), "object", 0, 2)
-    if custom:                               # solid color (no CAD texture)
-        gym.set_rigid_body_color(env, obj_actor, 0, gymapi.MESH_VISUAL_AND_COLLISION,
-                                 gymapi.Vec3(*obj_color))
-    else:                                    # DexYCB CAD texture
-        obj_tex = gym.create_texture_from_file(sim, str(meshes["tex"]))
-        gym.set_rigid_body_texture(env, obj_actor, 0,
-                                   gymapi.MESH_VISUAL_AND_COLLISION, obj_tex)
+    obj_actors = []
+    for oi, ob in enumerate(objects):
+        ou = f"_obj{oi}.urdf"
+        (urdf_dir / ou).write_text(
+            f'<robot name="obj{oi}"><link name="obj{oi}">'
+            f'<visual><geometry><mesh filename="{ob["meshes"]["vis"]}"/></geometry></visual>'
+            f'<collision><geometry><mesh filename="{ob["meshes"]["col"]}"/></geometry></collision>'
+            f'<inertial><mass value="0.3"/>'
+            f'<inertia ixx="1e-3" ixy="0" ixz="0" iyy="1e-3" iyz="0" izz="1e-3"/>'
+            f'</inertial></link></robot>')
+        asset = gym.load_asset(sim, str(urdf_dir), ou, oo)
+        actor = gym.create_actor(env, asset, gymapi.Transform(), ob["name"], 0, 2)
+        if ob["color"] is not None:            # solid color (custom / multi)
+            gym.set_rigid_body_color(env, actor, 0, gymapi.MESH_VISUAL_AND_COLLISION,
+                                     gymapi.Vec3(*ob["color"]))
+        else:                                  # DexYCB CAD texture
+            tex = gym.create_texture_from_file(sim, str(ob["meshes"]["tex"]))
+            gym.set_rigid_body_texture(env, actor, 0, gymapi.MESH_VISUAL_AND_COLLISION, tex)
+        obj_actors.append(actor)
     if physics:                              # match MuJoCo: high friction + generous
-        for act in (*hand_actors, obj_actor):   # contact_offset so near-miss fingers touch
+        for act in (*hand_actors, *obj_actors):   # contact_offset so near-miss fingers touch
             sh = gym.get_actor_rigid_shape_properties(env, act)
             for p in sh:
                 p.friction = 1.5
@@ -272,11 +287,13 @@ def main():
     root_state = gymtorch.wrap_tensor(gym.acquire_actor_root_state_tensor(sim))  # (2,13)
     cf_state = gymtorch.wrap_tensor(gym.acquire_net_contact_force_tensor(sim))    # (nb,3)
     dof_t = torch.from_numpy(dof_traj).float()
-    # object root pose per frame: [x,y,z, qx,qy,qz,qw] (IsaacGym xyzw)
-    obj_root = np.zeros((T, 13), dtype=np.float32)
-    obj_root[:, 0:3] = obj_pose_tag[:, 0:3]
-    obj_root[:, 3:7] = obj_pose_tag[:, [4, 5, 6, 3]]      # wxyz → xyzw
-    obj_root_t = torch.from_numpy(obj_root).float()
+    # each object's root pose per frame: [x,y,z, qx,qy,qz,qw] (IsaacGym xyzw)
+    obj_root_t = []
+    for ob in objects:
+        r = np.zeros((T, 13), dtype=np.float32)
+        r[:, 0:3] = ob["poses"][:T, 0:3]
+        r[:, 3:7] = ob["poses"][:T, [4, 5, 6, 3]]        # wxyz → xyzw
+        obj_root_t.append(torch.from_numpy(r).float())
 
     if do_render:
         import imageio.v2 as imageio
@@ -284,7 +301,7 @@ def main():
         # each hand base fixed at identity (set_actor_root_state writes ALL actors,
         # so an unset hand root with zero quat would teleport it off-screen); object
         # is the last actor (after the hand actors)
-        obj_idx = len(hand_actors)
+        obj_idx = len(hand_actors)               # objects follow the hand actors
         for hi in range(len(hand_actors)):
             root_state[hi, :] = 0.0; root_state[hi, 6] = 1.0
 
@@ -297,15 +314,17 @@ def main():
             for t in range(T):
                 dof_state[:, 0] = dof_t[t]; dof_state[:, 1] = 0
                 gym.set_dof_state_tensor(sim, gymtorch.unwrap_tensor(dof_state.view(-1, 2)))
-                root_state[obj_idx, :] = obj_root_t[t]
+                for k, rt in enumerate(obj_root_t):
+                    root_state[obj_idx + k, :] = rt[t]
                 gym.set_actor_root_state_tensor(sim, gymtorch.unwrap_tensor(root_state))
                 gym.simulate(sim); gym.fetch_results(sim, True)
                 grab()
         else:
-            # initial state: hand posed at frame 0, object at its frame-0 pose
+            # initial state: hand posed at frame 0, every object at its frame-0 pose
             dof_state[:, 0] = dof_t[0]; dof_state[:, 1] = 0
             gym.set_dof_state_tensor(sim, gymtorch.unwrap_tensor(dof_state.view(-1, 2)))
-            root_state[obj_idx, :] = obj_root_t[0]
+            for k, rt in enumerate(obj_root_t):
+                root_state[obj_idx + k, :] = rt[0]
             gym.set_actor_root_state_tensor(sim, gymtorch.unwrap_tensor(root_state))
             # settle the object onto the table (hand held at frame 0, NOT recorded)
             # so any initial ground/hand penetration jitter happens off-camera

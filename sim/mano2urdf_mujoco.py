@@ -257,28 +257,28 @@ def transform_frames_to_tag(frames, tag):
     return out
 
 
-def object_xml(meshes, mass=0.3, color=None):
+def object_xml(meshes, mass=0.3, color=None, sfx=""):
     """(asset_str, body_str) for a free-floating object. If `meshes` has a "tex"
     (DexYCB), the visual is textured; otherwise (custom CAD) it's a solid `color`
-    (RGB, default tan). Collision uses the (simpler) col mesh, invisible."""
+    (RGB, default tan). Collision uses the (simpler) col mesh, invisible. `sfx`
+    disambiguates names when several objects share one scene (obj_free{sfx}, …)."""
     if meshes.get("tex") and color is None:
-        vis_asset = (f'    <texture type="2d" name="obj_tex" file="{meshes["tex"]}"/>\n'
-                     f'    <material name="obj_mat" texture="obj_tex" specular="0.2"'
+        vis_asset = (f'    <texture type="2d" name="obj_tex{sfx}" file="{meshes["tex"]}"/>\n'
+                     f'    <material name="obj_mat{sfx}" texture="obj_tex{sfx}" specular="0.2"'
                      f' shininess="0.3" reflectance="0.0"/>\n')
-        vis_geom = ('material="obj_mat"')
     else:
         c = color or (0.75, 0.72, 0.62)
-        vis_asset = (f'    <material name="obj_mat" rgba="{c[0]} {c[1]} {c[2]} 1"'
+        vis_asset = (f'    <material name="obj_mat{sfx}" rgba="{c[0]} {c[1]} {c[2]} 1"'
                      f' specular="0.2" shininess="0.3"/>\n')
-        vis_geom = ('material="obj_mat"')
-    asset = (f'    <mesh name="obj_vis" file="{meshes["vis"]}"/>\n'
-             f'    <mesh name="obj_col" file="{meshes["col"]}"/>\n'
+    vis_geom = f'material="obj_mat{sfx}"'
+    asset = (f'    <mesh name="obj_vis{sfx}" file="{meshes["vis"]}"/>\n'
+             f'    <mesh name="obj_col{sfx}" file="{meshes["col"]}"/>\n'
              + vis_asset)
-    body = (f'    <body name="object" pos="0 0 0">\n'
-            f'      <freejoint name="obj_free"/>\n'
-            f'      <geom name="obj_col" type="mesh" mesh="obj_col" mass="{mass}"'
+    body = (f'    <body name="object{sfx}" pos="0 0 0">\n'
+            f'      <freejoint name="obj_free{sfx}"/>\n'
+            f'      <geom name="obj_col{sfx}" type="mesh" mesh="obj_col{sfx}" mass="{mass}"'
             f' contype="1" conaffinity="1" group="3" rgba="1 1 1 0"/>\n'
-            f'      <geom name="obj_vis" type="mesh" mesh="obj_vis" {vis_geom}'
+            f'      <geom name="obj_vis{sfx}" type="mesh" mesh="obj_vis{sfx}" {vis_geom}'
             f' contype="0" conaffinity="0" group="1" mass="0"/>\n'
             f'    </body>\n')
     return asset, body
@@ -369,6 +369,8 @@ def main():
                     help=".npy (T,7) [x,y,z, qw,qx,qy,qz], Z-up world frame")
     ap.add_argument("--object-color", default="0.75 0.72 0.62",
                     help="solid RGB for custom object")
+    ap.add_argument("--objects-json", default=None,
+                    help='JSON list [{"mesh","poses","color"}] to load MANY objects')
     args = ap.parse_args()
 
     urdf_dirs = [Path(args.urdf_dir).resolve()]
@@ -380,24 +382,35 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     print(f"[seq] {len(hand_frames)} hand(s), {len(hand_frames[0])} frames")
 
-    object_asset = object_body = ""
-    obj_pose_tag = None
+    # --- assemble the object list (0..N). Each: {meshes, color, poses(T,7), sfx} ---
+    objects = []
     dexycb_cam = None
     tag = None
-    if args.object_cad:                                        # custom (non-DexYCB)
-        obj_pose_tag = np.load(args.object_poses).astype(np.float32)   # (T,7) Z-up world
-        meshes = {"vis": str(Path(args.object_cad).resolve()),
-                  "col": str(Path(args.object_cad).resolve())}          # same mesh
-        color = tuple(float(x) for x in args.object_color.split())
-        object_asset, object_body = object_xml(meshes, color=color)
+    if args.objects_json:                                      # many objects (HO-Cap)
+        specs = json.load(open(args.objects_json))
+        for i, o in enumerate(specs):
+            m = str(Path(o["mesh"]).resolve())
+            col = tuple(float(x) for x in str(o.get("color", "0.75 0.72 0.62")).split())
+            objects.append({"meshes": {"vis": m, "col": m}, "color": col,
+                            "poses": np.load(o["poses"]).astype(np.float32), "sfx": str(i)})
+        print(f"[obj] {len(objects)} objects (multi, solid color, world frame)")
+    elif args.object_cad:                                      # single custom object
+        m = str(Path(args.object_cad).resolve())
+        col = tuple(float(x) for x in args.object_color.split())
+        objects.append({"meshes": {"vis": m, "col": m}, "color": col,
+                        "poses": np.load(args.object_poses).astype(np.float32), "sfx": ""})
         print(f"[obj] custom {Path(args.object_cad).name}  (solid color, world frame)")
-    elif args.subject and args.session:
+    elif args.subject and args.session:                        # DexYCB (textured)
         obj_name, meshes, obj_pose_tag, tag = load_dexycb_object_tag(
             args.dexycb_root, args.subject, args.session)
         hand_frames = [transform_frames_to_tag(f, tag) for f in hand_frames]   # → Z-up
-        object_asset, object_body = object_xml(meshes)
+        objects.append({"meshes": meshes, "color": None, "poses": obj_pose_tag, "sfx": ""})
         dexycb_cam = dexycb_camera_in_tag(args.dexycb_root, args.subject, args.session, tag)
         print(f"[obj] {obj_name}  (textured, tag frame)   [cam] DexYCB extrinsics")
+
+    xmls = [object_xml(o["meshes"], color=o["color"], sfx=o["sfx"]) for o in objects]
+    object_asset = "".join(a for a, _ in xmls)
+    object_body = "".join(b for _, b in xmls)
 
     wrists = np.array([f["wrist_xyz"] for fs in hand_frames for f in fs])
     if dexycb_cam is not None:
@@ -407,13 +420,13 @@ def main():
         lookat = f"{cam_tgt_t[0]:.4f} {cam_tgt_t[1]:.4f} {cam_tgt_t[2]:.4f}"
         floor_z = 0.0                                          # AprilTag table plane
     else:
-        # frame the whole scene from the full hand + object motion (pulled back)
+        # frame the whole scene from the full hand + all-object motion (pulled back)
         pts = wrists
-        if obj_pose_tag is not None:
-            pts = np.concatenate([wrists, obj_pose_tag[:, :3]], axis=0)
+        if objects:
+            pts = np.concatenate([wrists] + [o["poses"][:, :3] for o in objects], axis=0)
         cam_pos, lookat = scene_camera(pts)
-        if obj_pose_tag is not None and args.object_cad:      # desk = object rest height
-            floor_z = estimate_table_z(args.object_cad, obj_pose_tag)
+        if objects:                                            # desk = lowest object rest
+            floor_z = min(estimate_table_z(o["meshes"]["vis"], o["poses"]) for o in objects)
             print(f"[desk] table top inferred at z={floor_z:.3f} m (object rest)")
         else:
             floor_z = float(wrists[:, 2].min() - 0.20)
@@ -436,21 +449,24 @@ def main():
     to_qpos = build_qpos_indexer(model)
     base_q = data.qpos.copy()
 
-    obj_qadr = None
-    if obj_pose_tag is not None:
-        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "obj_free")
-        obj_qadr = model.jnt_qposadr[jid]
+    # qpos address of each object's free joint (obj_free{sfx})
+    obj_qadr = []
+    for o in objects:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f"obj_free{o['sfx']}")
+        obj_qadr.append(model.jnt_qposadr[jid])
 
     # per-frame reference full qpos — combine all hands into one qpos per frame
     T = min(len(fs) for fs in hand_frames)
+    if objects:
+        T = min(T, min(len(o["poses"]) for o in objects))
     ref_q = np.zeros((T, model.nq), dtype=np.float64)
     for t in range(T):
         q = base_q.copy()
         for fs in hand_frames:
             to_qpos(fs[t], q)                 # writes this hand's DOFs into q
         ref_q[t] = q
-    if obj_qadr is not None:
-        ref_q[:, obj_qadr:obj_qadr + 7] = obj_pose_tag[:T]
+    for o, qadr in zip(objects, obj_qadr):    # each object's freejoint pose per frame
+        ref_q[:, qadr:qadr + 7] = o["poses"][:T]
 
     renderer = mujoco.Renderer(model, height=args.height, width=args.width)
     out_frames = []

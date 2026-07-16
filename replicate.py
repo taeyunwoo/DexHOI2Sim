@@ -144,12 +144,18 @@ def prep_custom(hand_dicts, out, gen):
     return specs
 
 
-def prep_hocap(args, out, gen):
-    """HO-Cap session -> per-hand (URDF, frames) + the manipulated object.
+# distinct solid colors so multiple HO-Cap objects are told apart in the render
+_OBJ_PALETTE = ["0.85 0.6 0.3", "0.35 0.6 0.85", "0.5 0.8 0.4", "0.8 0.4 0.7",
+                "0.75 0.75 0.4", "0.55 0.45 0.85", "0.9 0.45 0.4", "0.4 0.8 0.8"]
 
-    Returns (hand_specs, obj_cad, obj_poses_npy, obj_color). Bimanual sessions
-    yield two hand_specs; the object is the one that moves the most (the one
-    being manipulated / handed over)."""
+
+def prep_hocap(args, out, gen):
+    """HO-Cap session -> per-hand (URDF, frames) + an objects manifest.
+
+    Returns (hand_specs, objects_json). Bimanual sessions yield two hand_specs.
+    By default ALL session objects are loaded (each a distinct color); pass
+    --hocap-object N to keep only the N-th, or 'moved' for the manipulated one."""
+    import json as _json
     import numpy as np, yaml
     sys.path.insert(0, str(ROOT / "sim"))
     from hocap_loader import load_hocap_session
@@ -183,11 +189,22 @@ def prep_hocap(args, out, gen):
 
     mv = [float(np.linalg.norm(o["poses"][:, :3] - o["poses"][0, :3], axis=1).max())
           for o in d["objects"]]
-    obj = d["objects"][int(np.argmax(mv))]
-    obj_poses = work / "obj_poses.npy"
-    np.save(obj_poses, obj["poses"])
-    print(f"[hocap] manipulated object={obj['id']} (moved {max(mv)*1000:.0f}mm)")
-    return hand_specs, obj["mesh"], str(obj_poses), "0.85 0.6 0.3"
+    sel = list(range(len(d["objects"])))              # default: ALL objects
+    if args.hocap_object == "moved":
+        sel = [int(np.argmax(mv))]
+    elif args.hocap_object is not None:
+        sel = [int(args.hocap_object)]
+    specs = []
+    for i in sel:
+        o = d["objects"][i]
+        pf = work / f"obj_{i}.npy"
+        np.save(pf, o["poses"])
+        specs.append({"mesh": o["mesh"], "poses": str(pf),
+                      "color": _OBJ_PALETTE[i % len(_OBJ_PALETTE)]})
+        print(f"[hocap] object[{i}]={o['id']} moved {mv[i]*1000:.0f}mm")
+    manifest = work / "objects.json"
+    _json.dump(specs, open(manifest, "w"))
+    return hand_specs, str(manifest)
 
 
 def main():
@@ -203,6 +220,8 @@ def main():
     ap.add_argument("--hocap", action="store_true",
                     help="replicate an HO-Cap session (uses --subject/--session)")
     ap.add_argument("--hocap-root", default="/root/data/hocap")
+    ap.add_argument("--hocap-object", default=None,
+                    help="which HO-Cap object(s): default all; an index N; or 'moved'")
     ap.add_argument("--betas-yml", default=None, help="MANO betas (custom)")
     ap.add_argument("--poses", default=None, help="(T,48) MANO axis-angle (custom)")
     ap.add_argument("--trans", default=None, help="(T,3) wrist translation (custom)")
@@ -243,10 +262,9 @@ def main():
                                  "left": args.left2})
     gen = ROOT / "mano2urdf" / "scripts"
 
-    if args.hocap:                                    # HO-Cap: 1-2 hands + object
-        hand_specs, obj_cad, obj_poses, obj_color = prep_hocap(args, out, gen)
-        obj_args = ["--object-cad", obj_cad, "--object-poses", obj_poses,
-                    "--object-color", obj_color]
+    if args.hocap:                                    # HO-Cap: 1-2 hands + N objects
+        hand_specs, objects_json = prep_hocap(args, out, gen)
+        obj_args = ["--objects-json", objects_json]
     elif args.custom:                                 # custom / bundle: 1-2 hands
         hand_specs = prep_custom(custom_hands, out, gen)
         obj_args = ["--object-cad", args.object_cad, "--object-poses", args.object_poses,
